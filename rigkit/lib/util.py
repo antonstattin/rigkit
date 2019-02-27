@@ -21,7 +21,6 @@ def get_dag_path(node=None):
     return m_dagpath
 
 
-
 # --------------------------
 #    Pymel Utils
 # --------------------------

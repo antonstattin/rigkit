@@ -1,20 +1,168 @@
+"""
+the connect module contains methods to build connections between transforms.
 
+"""
 import pymel.core as pm
 
 from . import util, matrix
-reload(matrix)
+
+def aim(driver, driven, **kwargs):
+    """ creates an aim constraint with matrix nodes
+
+        TODO: add Y and Z Aim Axis
+        TODO: FIX maintain offset! ITS NOT WORKING!
+    """
+
+    driver = pm.PyNode(driver)
+    driven = pm.PyNode(driven)
+
+    # query keyword arguments
+    name = kwargs.get("n", kwargs.get("name", "aimMatrix"))
+    maintain_offset = kwargs.get("mo", kwargs.get("maintainOffset", False))
+    prevent_benign_cycle = kwargs.get("pbc", kwargs.get("preventBenginCycle", True))
+    up_object = kwargs.get("uo", kwargs.get("upObject", None))
+
+    # create nodes
+    fbf_matrix = pm.createNode("fourByFourMatrix", n="_%s_FBFM"%name)
+    m_matrix = pm.createNode("multMatrix", n="_%s__MMAT"%name)
+    decompose_matrix = pm.createNode("decomposeMatrix", n="_%s_DEMAT"%name)
+    aim_vector = pm.createNode("plusMinusAverage",  n="_%s_aim_vector_PMA"%name)
+    driver_dmat = pm.createNode("decomposeMatrix", n="_%sDriver_DEMAT"%name)
+
+    # create aim vector
+    driver.worldMatrix[0] >> driver_dmat.inputMatrix
+    driver_dmat.outputTranslate >> aim_vector.input3D[0]
+
+    pm.setAttr(aim_vector + ".operation", 2)
+
+    if up_object:
+
+        up_object = pm.PyNode(up_object)
+
+        aim_target_dmat = pm.createNode("decomposeMatrix", n="_%sAimTarget_DMAT"%name)
+        up_object.worldMatrix[0] >> aim_target_dmat.inputMatrix
+        aim_target_dmat.outputTranslate >> aim_vector.input3D[1]
+
+        y_axis = pm.createNode("multMatrix", n="_%s_Y_AXIS_MMAT"%name)
+        z_axis = pm.createNode("multMatrix", n="_%s_Z_AXIS_MMAT"%name)
+
+        y_axis_dmat = pm.createNode("decomposeMatrix", n="_%s_Y_AXIS_DEMAT"%name)
+        z_axis_dmat = pm.createNode("decomposeMatrix", n="_%s_Z_AXIS_DEMAT"%name)
+
+        # create matrices relative to up object
+        uobj_t = pm.xform(up_object, t=True, ws=True, q=True)
+        y_matrix = [1,0,0,0,0,1,0,0,0,0,1,0, uobj_t[0], uobj_t[1]+1, uobj_t[0], 0]
+        z_matrix = [1,0,0,0,0,1,0,0,0,0,1,0,uobj_t[0], uobj_t[1], uobj_t[0]+1, 0]
+
+        y_axis.matrixIn[0].set(y_matrix)
+        z_axis.matrixIn[0].set(z_matrix)
+
+        up_object.worldMatrix[0] >> y_axis.matrixIn[1]
+        up_object.worldMatrix[0] >> z_axis.matrixIn[1]
+
+        y_axis.matrixSum >> y_axis_dmat.inputMatrix
+        z_axis.matrixSum >> z_axis_dmat.inputMatrix
+
+        y_axis_dmat.outputTranslate.outputTranslateX >> fbf_matrix.in10
+        y_axis_dmat.outputTranslate.outputTranslateY >> fbf_matrix.in11
+        y_axis_dmat.outputTranslate.outputTranslateZ >> fbf_matrix.in12
+
+        z_axis_dmat.outputTranslate.outputTranslateX >> fbf_matrix.in20
+        z_axis_dmat.outputTranslate.outputTranslateY >> fbf_matrix.in21
+        z_axis_dmat.outputTranslate.outputTranslateZ >> fbf_matrix.in22
+
+    else:
+        target_loc = pm.group(n="_%sVector_LOC"%name)
+        pm.parent(target_loc, driven)
+
+        target_loc.getShape().worldPosition[0] >> aim_vector.input3D[1]
+
+        for axis in ["x", "y", "z"]:
+            pm.setAttr("%s.t%s"%(target_loc, axis), lock=True, k=False)
+            pm.setAttr("%s.r%s"%(target_loc, axis), lock=True, k=False)
+            pm.setAttr("%s.s%s"%(target_loc, axis), lock=True, k=False)
+
+        pm.setAttr("%s.v"%(target_loc), 0)
+        pm.setAttr("%s.v"%(target_loc), lock=True, k=False)
+
+
+    aim_vector.output3D.output3Dx >> fbf_matrix.in00
+    aim_vector.output3D.output3Dy >> fbf_matrix.in01
+    aim_vector.output3D.output3Dz >> fbf_matrix.in02
+
+    fbf_matrix.output >> decompose_matrix.inputMatrix
+
+
+    # DO we need to inverseParent???
+    if maintain_offset:
+        mult_matrix = pm.createNode("multMatrix", n="_%sMaintainOffset_MMAT"%name)
+
+        # lazy.. create a transform to extract offset matrix
+        tmp_transform = pm.group(n="_tmp_transform", em=True)
+
+        decompose_matrix.outputTranslate >> tmp_transform.translate
+        decompose_matrix.outputRotate >> tmp_transform.rotate
+
+        offset_matrix = matrix.get_local_offset(tmp_transform, driven)
+        offset_matrix = [offset_matrix(i, j) for i in range(4) for j in range(4)]
+        pm.setAttr(mult_matrix + ".matrixIn[0]", offset_matrix, type="matrix")
+
+        fbf_matrix.output // decompose_matrix.inputMatrix
+        fbf_matrix.output >> mult_matrix.matrixIn[1]
+
+        # disconnect and delete tmp loc
+        decompose_matrix.outputTranslate // tmp_transform.translate
+        decompose_matrix.outputRotate // tmp_transform.rotate
+
+        pm.delete(tmp_transform)
+
+        if prevent_benign_cycle:
+            matrix.prevent_benign_cycle(mult_matrix, 2, driven)
+        else:
+            pm.connectAttr(driven[0] + ".parentInverseMatrix[0]",
+                           mult_matrix + ".matrixIn[2]")
+
+        mult_matrix.matrixSum >> decompose_matrix.inputMatrix
+
+    else:
+        fbf_matrix.output // decompose_matrix.inputMatrix
+        mult_matrix = pm.createNode("multMatrix", n="_%sInverseParent_MMAT"%name)
+
+        fbf_matrix.output >> mult_matrix.matrixIn[0]
+
+        if prevent_benign_cycle:
+            rm_m_matrix = matrix.prevent_benign_cycle(mult_matrix, 1, driven)
+            if not rm_m_matrix:
+                fbf_matrix.output >> decompose_matrix.inputMatrix
+                pm.delete(mult_matrix)
+            else:
+                mult_matrix.matrixSum >> decompose_matrix.inputMatrix
+        else:
+            pm.connectAttr(driven[0] + ".parentInverseMatrix[0]",
+                           mult_matrix + ".matrixIn[1]")
+
+            mult_matrix.matrixSum >> decompose_matrix.inputMatrix
+
+
+    decompose_matrix.outputRotate >> driven.rotate
+
 
 def attach_to_nurbsurface(driven, nurbssurface, **kwargs):
     """ Creates a rivet on a nurbs surface
-
 
 
         :param kwargs:
             name - n : name of setup
             maintainOffset - mo: maintain offset
             scale - s: connect scale
-            rotate - ro: connect rotate
-            translate - t: connect translate
+            uValue - u: the u value (float, 0-1)
+            vValue - v: the v value (float, 0-1)
+            preventBenginCycle - pbc: connects parent instead of
+                                      driven .parentInverseMatrix
+
+        (could add a squashy option where we connect the scale
+         to create a squash effect. is it ever useful though?)
+
    """
 
     nurbssurface = util.get_pynodes(nurbssurface)[0]
@@ -32,6 +180,8 @@ def attach_to_nurbsurface(driven, nurbssurface, **kwargs):
     u_value = kwargs.get("u", kwargs.get("uValue", 0))
     v_value = kwargs.get("v", kwargs.get("vValue", 0))
     maintain_offset = kwargs.get("mo", kwargs.get("maintainOffset", False))
+    do_scale = kwargs.get("s", kwargs.get("scale", False))
+    prevent_benign_cycle = kwargs.get("pbc", kwargs.get("preventBenginCycle", True))
 
     # create nodes
     fbf_matrix = pm.createNode("fourByFourMatrix", n="_%s_FBFM"%name)
@@ -84,8 +234,12 @@ def attach_to_nurbsurface(driven, nurbssurface, **kwargs):
 
         # lazy.. create a transform to extract offset matrix
         tmp_transform = pm.group(n="_tmp_transform", em=True)
+
+
         decompose_matrix.outputTranslate >> tmp_transform.translate
         decompose_matrix.outputRotate >> tmp_transform.rotate
+        if do_scale: decompose_matrix.outputScale >> tmp_transform.scale
+
         offset_matrix = matrix.get_local_offset(tmp_transform, driven)
         offset_matrix = [offset_matrix(i, j) for i in range(4) for j in range(4)]
         pm.setAttr(mult_matrix + ".matrixIn[0]", offset_matrix, type="matrix")
@@ -98,10 +252,20 @@ def attach_to_nurbsurface(driven, nurbssurface, **kwargs):
         # disconnect and delete tmp loc
         decompose_matrix.outputTranslate // tmp_transform.translate
         decompose_matrix.outputRotate // tmp_transform.rotate
+        if do_scale: decompose_matrix.outputScale // tmp_transform.scale
+
         pm.delete(tmp_transform)
+
+        if prevent_benign_cycle:
+            matrix.prevent_benign_cycle(mult_matrix, 2, driven)
+        else:
+            pm.connectAttr(driven[0] + ".parentInverseMatrix[0]",
+                           mult_matrix + ".matrixIn[2]")
 
     decompose_matrix.outputTranslate >> driven.translate
     decompose_matrix.outputRotate >> driven.rotate
+    if do_scale:
+        decompose_matrix.outputScale >> driven.scale
 
 
 def parent(*arg, **kwargs):
@@ -199,13 +363,8 @@ def parent(*arg, **kwargs):
 
 
     if prevent_benign_cycle:
-        # get the parent if none then use world and skip
-        parent = pm.listRelatives(driven, p=True)
 
-        if parent:
-            driven_input = "{mmult}.matrixIn[{count}]".format(mmult=mult_matrix,
-                                                              count=input_count)
-            pm.connectAttr(parent[0] + ".worldInverseMatrix[0]", driven_input)
+        if matrix.prevent_benign_cycle(mult_matrix, input_count, driven):
             input_count += 1
     else:
         driven_input = "{mmult}.matrixIn[{count}]".format(mmult=mult_matrix,
